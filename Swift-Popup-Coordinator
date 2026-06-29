@@ -1,0 +1,236 @@
+# Popup System Refactor Plan
+
+A phased plan for an agent (e.g. Claude Code) to review the existing popup
+"sequencer + coordinator" and migrate it to a rule-based, single-winner
+architecture for a SwiftUI app.
+
+## Ground rules for the agent
+
+- Work in **phases**. Do **not** jump ahead.
+- For every phase: show **before/after diffs** and **STOP for approval** before
+  the next phase.
+- **Behavior must be identical unless a change is flagged explicitly.** Refactors
+  tend to silently "fix" or break edge cases — surface every behavioral
+  difference in writing.
+- One popup per turn during migration (Phase 2). Keep diffs small and reviewable.
+
+## Target architecture
+
+- Each popup is a **self-contained rule**: `id`, `priority`,
+  `async shouldPresent(context)`, `makeView()`. Adding a popup means adding one
+  file — never editing a central `if/else` or `switch`.
+- A central **engine** selects a **single winner** per trigger by priority
+  (not a stacking queue).
+- A SwiftUI **presenter** exposing an `@Observable active: PopupRule?`, driven by
+  `.sheet(item:)` / `.fullScreenCover(item:)`.
+- **Mutual exclusion** so overlapping triggers can't double-present, with
+  presentation on the main actor.
+
+### Condition & state logic — discover, don't assume
+
+The refactor changes **structure**, not **behavior**. Every condition that
+currently decides whether a popup shows — and every piece of state it reads
+(flags, counters, dates, remote config, DB, whatever it happens to be) — must be
+**found in the existing code and preserved as-is**. This plan does **not**
+prescribe where state lives or how conditions are computed; the agent discovers
+that during the audit and carries it over unchanged.
+
+If the audit finds repeated "already shown / cooldown" logic, consolidate it into
+one place behind the project's existing `StoredKey`-style storage abstraction (so
+it's in-memory in tests, real storage in prod). If no such logic exists, do not
+invent it. Mirror what's there.
+
+## Reference shape (target structure — illustrative, not prescriptive)
+
+> Note: `PopupStore`/`buildContext` below are placeholders for **whatever state
+> mechanism the audit finds**. Do not adopt these names or fields blindly —
+> shape them around the existing condition logic.
+
+```swift
+protocol PopupRule {
+    var id: PopupID { get }
+    var priority: Int { get }
+    func shouldPresent(_ ctx: PopupContext) async -> Bool
+    func makeView() -> AnyView
+}
+
+enum PopupTrigger { case appLaunch, enterForeground, didFinishTask /* ... */ }
+
+actor PopupEngine {
+    private let rules: [PopupRule]
+    func winner(for trigger: PopupTrigger, ctx: PopupContext) async -> PopupRule? {
+        var eligible: [PopupRule] = []
+        for r in rules where await r.shouldPresent(ctx) { eligible.append(r) }
+        return eligible.max { $0.priority < $1.priority }   // single winner
+    }
+}
+
+@MainActor @Observable
+final class PopupPresenter {
+    var active: PopupRule?
+    private var isPresenting = false
+    private let engine: PopupEngine
+    private let store: PopupStore
+
+    func evaluate(_ trigger: PopupTrigger) async {
+        guard !isPresenting else { return }
+        let ctx = await buildContext(trigger)
+        guard let rule = await engine.winner(for: trigger, ctx: ctx) else { return }
+        isPresenting = true
+        active = rule
+    }
+
+    func dismissed(_ rule: PopupRule) {
+        store.markShown(rule.id)
+        active = nil
+        isPresenting = false
+    }
+}
+```
+
+---
+
+## Phase 0 — Context (run once at session start)
+
+> I have a popup system in a SwiftUI app: a "sequencer" that defines an ordered
+> set of popups and a coordinator (a Swift class) that, on triggers from the main
+> coordinator, checks each popup's condition and presents the first/eligible one.
+>
+> I want to refactor it toward the architecture described in
+> `POPUP_REFACTOR_PLAN.md` (rule-based popups, a single-winner engine, and a
+> SwiftUI `@Observable` presenter).
+>
+> Important: the existing presentation conditions and the state they read are the
+> source of truth. Find that logic in the current code and preserve it — do not
+> assume where state comes from or how conditions are computed. The refactor
+> changes structure, not behavior.
+>
+> Work in phases. Do NOT write or change code yet. For each phase, show me
+> before/after diffs and STOP for my approval before proceeding. Confirm you
+> understand.
+
+## Discovery — Locate the popup system (awareness)
+
+Run this **before** the audit. Its only job is to make the agent find every piece
+of the existing popup system, so nothing gets missed and silently dropped.
+
+> Discovery — Do NOT change anything. First, locate the entire popup system in
+> this codebase so we're certain we have the full picture before refactoring.
+>
+> Search broadly, not just by the names I've used:
+>
+> - The sequencer type and the coordinator class that drives popups.
+> - Every popup these manage, and their view types.
+> - SwiftUI presentation sites: `.sheet`, `.fullScreenCover`, `.popover`,
+>   `.alert`, `.confirmationDialog`, and any custom overlay presentation.
+> - Anything matching terms like "popup", "sequence(r)", "coordinator",
+>   "present", "modal", "onboarding", "prompt", "banner".
+> - Any popups presented OUTSIDE the sequencer (one-off `.sheet`s elsewhere) —
+>   flag these as "not currently managed; confirm whether they belong in scope".
+>
+> Produce a table: file path · symbol/type · what it presents · how it's
+> triggered · whether it goes through the sequencer or is presented independently.
+> Then explicitly state: "This is the complete set" or list what you're unsure
+> about. STOP and wait for me to confirm the set is complete before auditing.
+
+**Why this gate matters:** the correctness of the whole refactor depends on
+converting _every_ popup. Confirming the full inventory here — including stray
+popups presented outside the sequencer — is what prevents behavior from quietly
+disappearing later.
+
+## Phase 1 — Audit only, no changes
+
+> Phase 0 — Audit. Using the confirmed inventory from Discovery, read the
+> sequencer, the coordinator, and every popup in that set. Do not modify anything.
+> Produce a short report covering:
+>
+> 1. Is the current behavior "pick one winner per trigger" or "queue multiple in
+>    sequence"? Quote the lines that decide this.
+> 2. List every popup, its trigger point(s), and its presentation condition.
+> 3. Where does each condition read state from (UserDefaults, DB, remote config)?
+> 4. Frequency capping: is "don't show again / cooldown" logic duplicated across
+>    popups?
+> 5. Concurrency: can two triggers race into a double-present? Is presentation on
+>    the main actor?
+> 6. How tightly is the decision logic coupled to the sequencer body (does adding
+>    a popup require editing a central if/else or switch)?
+>
+> End with a proposed phase plan to reach the target architecture, ordered to keep
+> each diff small. Then stop.
+
+**Why this matters:** the audit settles whether "order + first condition that
+meets" is winner-selection or queueing. Require quoted lines so it isn't a guess.
+
+## Phase 2 — Scaffold the abstractions (additive only)
+
+> Phase 1 — Add the new abstractions WITHOUT touching existing popups or wiring
+> yet. Create, in new files:
+>
+> - `PopupID`, `PopupTrigger`, `PopupContext` — where `PopupContext` carries
+>   exactly the state the existing conditions read (as found in the audit), and
+>   nothing invented.
+> - `protocol PopupRule { id; priority; func shouldPresent(_:) async -> Bool;
+func makeView() -> AnyView }`
+> - `PopupEngine` that returns the single highest-priority eligible rule for a
+>   trigger.
+> - ONLY IF the audit found repeated "already shown / cooldown" logic: a single
+>   store to hold it, behind the project's existing StoredKey-style storage
+>   abstraction (in-memory + real implementations). If no such logic exists,
+>   skip this — do not introduce new state.
+>
+> The existing system must still compile and behave identically after this phase
+> — these are unused additions. Show the diff and stop.
+
+## Phase 3 — Migrate popups one at a time
+
+> Phase 2 — Migrate ONE popup (start with the simplest) into a `PopupRule`
+> conforming type. Move its existing condition into `shouldPresent` **verbatim** —
+> same checks, same state sources, same order — and its view into `makeView`. If
+> that popup has "already shown / cooldown" handling, relocate it into the shared
+> store from Phase 1 without changing what it computes. Do not add, drop, or
+> reinterpret any condition. Leave it registered in BOTH the old path and the new
+> engine for now if needed, but mark the old path clearly. Show before/after diff
+> for that one popup only, explicitly call out any behavior difference (there
+> should be none), and stop.
+>
+> After I approve, repeat for the next popup. One popup per turn.
+
+**Checkpoint:** after the first popup migrates, confirm winner-vs-queue matches
+intent. If the old code queues but you want a single winner, that's a deliberate
+behavior change — not something buried in a diff.
+
+## Phase 4 — Swap in the engine + SwiftUI presenter
+
+> Phase 3 — Replace the coordinator's decision logic with the engine, and replace
+> imperative presentation with a SwiftUI `@Observable` presenter exposing
+> `active: PopupRule?`, driven by `.sheet(item:)` or `.fullScreenCover(item:)` at
+> the app's root. The main coordinator should now call
+> `presenter.evaluate(trigger:)` at each trigger point instead of running
+> conditions itself.
+>
+> Add a mutual-exclusion guard so overlapping triggers can't double-present, and
+> ensure presentation runs on the main actor. Delete the old sequencer decision
+> code only after the new path covers every popup. Show the full diff and stop.
+
+## Phase 5 — Tests + cleanup
+
+> Phase 4 — Write tests for: priority winner selection when multiple rules are
+> eligible; the double-present guard under two near-simultaneous triggers; and
+> per-trigger eligibility. If a cooldown/seen store exists, use its in-memory
+> implementation to test suppression too. Then remove dead code from the old path
+> and list anything left coupled to the sequencer. Show the diff and stop.
+
+---
+
+## Definition of done
+
+- [ ] Adding a new popup requires only one new file, no central edits.
+- [ ] Engine returns a single winner per trigger by priority.
+- [ ] Every existing condition and its state source is preserved unchanged; no
+      conditions added, dropped, or reinterpreted.
+- [ ] Any cooldown/seen logic that already existed is consolidated in one place;
+      none was invented where it didn't exist.
+- [ ] Overlapping triggers cannot double-present; presentation is main-actor.
+- [ ] Tests cover winner selection, cooldown, the double-present guard, and
+      per-trigger eligibility.
+- [ ] Old sequencer decision code is removed.
